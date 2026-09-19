@@ -198,6 +198,25 @@ const HERRAMIENTAS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'proveedores',
+    description: 'Los proveedores: qué se les debe, qué vence pronto y cuánto se les compró. Usala para "a quién le debo", "qué pago esta semana", "cuánto le compramos a X" o cuando la pregunta sea sobre compras.',
+    input_schema: {
+      type: 'object',
+      properties: { nombre: { type: 'string', description: 'Opcional: para mirar uno solo' } },
+    },
+  },
+  {
+    name: 'que_compra_cada_proveedor',
+    description: 'Qué productos trae cada proveedor, con su precio y cuánto se vende. Usala cuando pregunten a quién comprarle algo, o qué trae un proveedor.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        producto: { type: 'string', description: 'Parte del nombre de un producto, para ver quién lo trae' },
+        proveedor: { type: 'string', description: 'Parte del nombre de un proveedor, para ver qué trae' },
+      },
+    },
+  },
+  {
     name: 'recordar',
     description: 'Guarda una nota sobre cómo funciona este negocio, para tenerla en cuenta en todas las consultas siguientes. Usala cuando te corrijan un dato, te expliquen una palabra que se usa adentro o te digan una regla del negocio que no está en los datos. No la uses para guardar números que cambian (stock, precios, ventas): esos se consultan cada vez.',
     input_schema: {
@@ -442,6 +461,79 @@ async function ejecutarHerramienta(nombre, entrada) {
         total: vivos.length,
         altas_este_mes: vivos.filter(m => String(m.created_at || '').slice(0, 7) === mes).length,
       },
+    };
+  }
+
+  if (nombre === 'proveedores') {
+    const filtro = String(e.nombre || '').trim().toLowerCase();
+    const [pagos, parciales] = await Promise.all([
+      traerTodo(srv, 'ops', 'pagos_proveedores', 'id,proveedor,monto,tipo,fecha_pedido,fecha_vencimiento,pagado,iva_credito'),
+      traerTodo(srv, 'ops', 'pagos_parciales', 'pago_id,monto'),
+    ]);
+    const yaPago = {};
+    parciales.forEach(x => { yaPago[x.pago_id] = (yaPago[x.pago_id] || 0) + (Number(x.monto) || 0); });
+
+    const hoy = new Date().toISOString().slice(0, 10);
+    const porProveedor = {};
+    pagos.forEach(p => {
+      const quien = p.proveedor || '—';
+      if (filtro && !quien.toLowerCase().includes(filtro)) return;
+      const monto = Number(p.monto) || 0;
+      const pagado = (p.pagado === true) ? monto : (yaPago[p.id] || 0);
+      const debe = Math.max(monto - pagado, 0);
+      const d = porProveedor[quien] || (porProveedor[quien] = {
+        proveedor: quien, debe: 0, vencido: 0, comprado_total: 0, comprobantes: 0, proximo_vencimiento: null });
+      d.comprado_total += monto;
+      d.comprobantes++;
+      if (debe > 0) {
+        d.debe += debe;
+        if (p.fecha_vencimiento && p.fecha_vencimiento < hoy) d.vencido += debe;
+        if (p.fecha_vencimiento && (!d.proximo_vencimiento || p.fecha_vencimiento < d.proximo_vencimiento)) {
+          d.proximo_vencimiento = p.fecha_vencimiento;
+        }
+      }
+    });
+
+    const lista = Object.values(porProveedor)
+      .map(d => ({ ...d, debe: Math.round(d.debe), vencido: Math.round(d.vencido), comprado_total: Math.round(d.comprado_total) }))
+      .sort((a, b) => b.debe - a.debe).slice(0, 25);
+    return { resultado: lista, nota: 'montos en pesos; "vencido" es lo que ya pasó su fecha de pago' };
+  }
+
+  if (nombre === 'que_compra_cada_proveedor') {
+    const { data: provs, error: eProv } = await srv.schema('ops').from('proveedores')
+      .select('id,nombre,activo');
+    if (eProv) throw new Error(eProv.message);
+    const nombreProv = Object.fromEntries((provs || []).map(p => [p.id, p.nombre]));
+
+    let q = srv.schema('ops').from('productos')
+      .select('id,nombre,marca,precio_venta,costo_sin_iva,proveedor_preferido_id')
+      .eq('activo', true).limit(25);
+    if (e.producto) q = q.ilike('nombre', `%${String(e.producto).slice(0, 40)}%`);
+    if (e.proveedor) {
+      const ids = (provs || []).filter(p => String(p.nombre || '').toLowerCase()
+        .includes(String(e.proveedor).toLowerCase())).map(p => p.id);
+      if (!ids.length) return { resultado: [], nota: 'No hay ningún proveedor con ese nombre' };
+      q = q.in('proveedor_preferido_id', ids);
+    }
+    const { data, error } = await q;
+    if (error) throw new Error(error.message);
+
+    const ids = (data || []).map(p => p.id);
+    const { data: vend } = await srv.schema('club').from('ventas_resumen')
+      .select('producto_id,unidades').in('producto_id', ids.length ? ids : [0]);
+    const ventas = Object.fromEntries((vend || []).map(v => [v.producto_id, Number(v.unidades) || 0]));
+
+    return {
+      resultado: (data || []).map(p => ({
+        producto: p.nombre,
+        marca: p.marca,
+        proveedor: nombreProv[p.proveedor_preferido_id] || 'sin proveedor asignado',
+        precio: Number(p.precio_venta) || 0,
+        costo_sin_iva: Number(p.costo_sin_iva) || 0,
+        unidades_90d: ventas[p.id] || 0,
+      })),
+      nota: 'el proveedor es el preferido que tiene cargado el producto',
     };
   }
 
