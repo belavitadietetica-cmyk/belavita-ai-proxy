@@ -198,6 +198,15 @@ const HERRAMIENTAS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'recordar',
+    description: 'Guarda una nota sobre cómo funciona este negocio, para tenerla en cuenta en todas las consultas siguientes. Usala cuando te corrijan un dato, te expliquen una palabra que se usa adentro o te digan una regla del negocio que no está en los datos. No la uses para guardar números que cambian (stock, precios, ventas): esos se consultan cada vez.',
+    input_schema: {
+      type: 'object',
+      properties: { nota: { type: 'string', description: 'La nota, en una o dos frases, como se la contarías a alguien que entra a trabajar mañana' } },
+      required: ['nota'],
+    },
+  },
+  {
     name: 'sin_peso',
     description: 'Productos sin peso cargado: la tienda online no les puede cotizar el envío. Usala si preguntan por envíos, por la tienda online o qué falta configurar.',
     input_schema: {
@@ -208,6 +217,48 @@ const HERRAMIENTAS = [
 ];
 
 const tope = (n, def, max) => Math.min(Math.max(parseInt(n || def, 10) || def, 1), max);
+
+// ── LAS SUCURSALES, POR SU NOMBRE ──
+//
+// El asistente decía "bv1: 2, bv2: 3, bv3: 0". Nadie en el negocio habla
+// así, y peor: bv3 es Chacras, que cerró. Un dato viejo dicho con seguridad
+// es el peor error que puede cometer.
+//
+// Se leen una vez cada cinco minutos: cambian una vez por año.
+let sucursalesCache = { at: 0, datos: null };
+
+async function sucursales() {
+  if (sucursalesCache.datos && Date.now() - sucursalesCache.at < 5 * 60 * 1000) {
+    return sucursalesCache.datos;
+  }
+  try {
+    const { data, error } = await srv.schema('ops').from('sucursales').select('id,nombre,activa');
+    if (error) throw new Error(error.message);
+    const vivas = (data || []).filter(s => s.activa !== false);
+    // Una lista vacía casi seguro es un error de lectura, no un negocio sin
+    // locales: no se cachea, así se reintenta en la consulta siguiente.
+    if (vivas.length) sucursalesCache = { at: Date.now(), datos: vivas };
+    else return [];
+  } catch (e) {
+    console.error('⚠ no se pudieron leer las sucursales:', e.message);
+    if (!sucursalesCache.datos) sucursalesCache = { at: 0, datos: [] };
+  }
+  return sucursalesCache.datos;
+}
+
+// Convierte {bv1: 12, bv3: 0} en {Beltrán: 12}: nombres reales y sin las que
+// ya no existen.
+function conNombres(porId, lista) {
+  // Sin la lista de sucursales no se puede traducir, y esconder el stock
+  // sería peor que mostrarlo con su código: se devuelve tal cual.
+  if (!lista?.length) return porId || {};
+  const nombre = Object.fromEntries(lista.map(s => [s.id, s.nombre || s.id]));
+  const salida = {};
+  Object.entries(porId || {}).forEach(([id, v]) => {
+    if (nombre[id]) salida[nombre[id]] = v;
+  });
+  return salida;
+}
 
 // Trae una tabla completa en páginas de 1000, que es el tope de PostgREST.
 async function traerTodo(cliente, esquema, vista, columnas, filtro) {
@@ -266,6 +317,7 @@ async function ejecutarHerramienta(nombre, entrada) {
       srv.schema('ops').from('stock_sucursal').select('producto_id,sucursal_id,cantidad').in('producto_id', ids),
       srv.schema('club').from('ventas_resumen').select('producto_id,unidades').in('producto_id', ids),
     ]);
+    const locales = await sucursales();
     const porProd = {};
     (stock || []).forEach(s => {
       porProd[s.producto_id] = porProd[s.producto_id] || {};
@@ -280,7 +332,7 @@ async function ejecutarHerramienta(nombre, entrada) {
         marca: p.marca,
         precio: Number(p.precio_venta) || 0,
         costo_sin_iva: Number(p.costo_sin_iva) || 0,
-        stock_por_sucursal: porProd[p.id] || {},
+        stock_por_sucursal: conNombres(porProd[p.id], locales),
         kg_a_granel: Number(p.stock_kg_actual) || 0,
         unidades_90d: ventas[p.id] || 0,
         se_vende: p.se_vende !== false && p.activo !== false,
@@ -327,7 +379,12 @@ async function ejecutarHerramienta(nombre, entrada) {
       porDia[k].total += Number(v.monto_total) || 0;
       porDia[k].tickets++;
     });
-    const lista = Object.values(porDia).sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
+    const locales = await sucursales();
+    const nombre = Object.fromEntries(locales.map(s => [s.id, s.nombre || s.id]));
+    const lista = Object.values(porDia)
+      .filter(d => !locales.length || nombre[d.sucursal])
+      .map(d => ({ ...d, sucursal: nombre[d.sucursal] || d.sucursal }))
+      .sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
     return { resultado: lista, nota: `ventas de los últimos ${dias} días, por día y sucursal` };
   }
 
@@ -388,6 +445,16 @@ async function ejecutarHerramienta(nombre, entrada) {
     };
   }
 
+  if (nombre === 'recordar') {
+    const nota = String(e.nota || '').trim().slice(0, 400);
+    if (nota.length < 8) return { error: 'La nota es muy corta' };
+    const { error } = await srv.schema('ops').from('ia_contexto')
+      .insert({ nota, origen: 'asistente' });
+    if (error) throw new Error(error.message);
+    contextoCache = { at: 0, texto: null };   // que la próxima consulta ya la use
+    return { ok: true, nota, donde: 'Queda anotado y se puede borrar desde Cyron' };
+  }
+
   if (nombre === 'sin_peso') {
     const limite = tope(e.limite, 15, 30);
     const { data, error } = await srv.schema('club').from('pesos_pendientes')
@@ -412,6 +479,53 @@ Tenés herramientas para consultar los datos reales del negocio. Usalas siempre 
 
 Los montos son en pesos argentinos. Cuando des una recomendación, apoyala en el número que viste y decí de dónde salió. Preferí respuestas cortas: tres o cuatro frases, o una lista breve. Si algo no se puede saber con las herramientas que tenés, decilo sin rodeos en vez de estimar.`;
 
+// ══════════════════════════════════════════════════════════════════════
+//  LO QUE SABE DEL NEGOCIO
+//
+//  El modelo no aprende con el uso: cada consulta arranca de cero. Lo único
+//  que lo hace conocer el negocio es esto, que viaja en cada pregunta: quién
+//  es el negocio, qué sucursales tiene HOY y las notas que fue juntando.
+//
+//  Se arma una vez cada cinco minutos. Si falla, el asistente trabaja igual,
+//  solo que sin esa memoria.
+// ══════════════════════════════════════════════════════════════════════
+let contextoCache = { at: 0, texto: null };
+
+async function contextoDelNegocio() {
+  if (contextoCache.texto && Date.now() - contextoCache.at < 5 * 60 * 1000) {
+    return contextoCache.texto;
+  }
+  let texto = '';
+  try {
+    const [locales, notas, config] = await Promise.all([
+      sucursales(),
+      srv.schema('ops').from('ia_contexto').select('nota')
+        .eq('activa', true).order('created_at', { ascending: false }).limit(40),
+      srv.schema('ops').from('config').select('clave,valor')
+        .in('clave', ['negocio_nombre', 'negocio_rubro', 'negocio_ciudad']),
+    ]);
+
+    const cfg = Object.fromEntries((config.data || []).map(c => [c.clave, c.valor]));
+    if (cfg.negocio_nombre) {
+      texto += `\n\nEl negocio es ${cfg.negocio_nombre}` +
+        (cfg.negocio_rubro ? `, ${cfg.negocio_rubro}` : '') +
+        (cfg.negocio_ciudad ? ` en ${cfg.negocio_ciudad}` : '') + '.';
+    }
+    if (locales.length) {
+      texto += `\nSucursales: ${locales.map(s => `${s.nombre} (${s.id})`).join(', ')}. ` +
+        `No existe ninguna otra: si aparece una que no está en esta lista, es un dato viejo.`;
+    }
+    if ((notas.data || []).length) {
+      texto += '\n\nLo que sabés de este negocio:\n' +
+        notas.data.map(n => `- ${n.nota}`).join('\n');
+    }
+    contextoCache = { at: Date.now(), texto };
+  } catch (e) {
+    console.error('⚠ no se pudo armar el contexto:', e.message);
+  }
+  return contextoCache.texto || '';
+}
+
 async function conversarConHerramientas({ pregunta, historial, usuario, modelo }) {
   const mensajes = [];
   (historial || []).slice(-6).forEach(m => {
@@ -433,7 +547,7 @@ async function conversarConHerramientas({ pregunta, historial, usuario, modelo }
     const r = await llamarAnthropic({
       model: modelo,
       max_tokens: MAX_TOKENS_TOPE,
-      system: SISTEMA,
+      system: SISTEMA + (srv ? await contextoDelNegocio() : ''),
       tools: srv ? HERRAMIENTAS : undefined,
       messages: mensajes,
     });
