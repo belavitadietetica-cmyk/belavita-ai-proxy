@@ -688,6 +688,85 @@ async function conversarConHerramientas({ pregunta, historial, usuario, modelo }
   };
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  ENTENDER UN FRACCIONAMIENTO DICTADO
+//
+//  Lucas tiene las manos ocupadas y sucias: no va a escribir. Toca un botón,
+//  dice "fraccioné cinco kilos de almendra Non Pareil en Beltrán" y suelta.
+//
+//  Esta ruta SOLO ENTIENDE la frase: no toca el stock. Devuelve qué producto
+//  es, cuántos kilos y en qué sucursal, para que Cyron lo muestre y la
+//  persona confirme. Escribir sin que alguien lea lo que entendió es la
+//  forma más rápida de arruinar un inventario.
+//
+//  Si algo no queda claro —dos productos parecidos, no se entendió la
+//  cantidad— lo dice y no propone nada.
+// ══════════════════════════════════════════════════════════════════════
+const SISTEMA_ACCION = `Traducís a datos lo que alguien dicta mientras trabaja en una dietética.
+
+Devolvés SOLO un JSON, sin texto alrededor y sin marcas de código, con esta forma:
+{"accion":"fraccionar","producto":"texto para buscar el producto","kg":numero,"sucursal":"bv1|bv2|null","confianza":"alta|baja","motivo":"si confianza es baja, qué falta"}
+
+Reglas:
+- "kg" en números, aunque lo digan en letras: "cinco kilos y medio" es 5.5.
+- La sucursal sale del nombre del local si lo dicen (Beltrán es bv1, Maipú es bv2). Si no lo dicen, null.
+- En "producto" poné solo lo justo para buscarlo: "almendra non pareil", no la frase entera.
+- Si no se entiende la cantidad, o no queda claro qué producto es, poné confianza "baja" y explicá en motivo qué falta.
+- Nunca inventes un producto que no te nombraron.`;
+
+async function entenderAccion({ frase, usuario, modelo }) {
+  const r = await llamarAnthropic({
+    model: modelo,
+    max_tokens: 400,
+    system: SISTEMA_ACCION,
+    messages: [{ role: 'user', content: String(frase).slice(0, 500) }],
+  });
+
+  await anotarUso({ modelo, respuesta: r.json, para: 'accion', pregunta: frase,
+    usuario, ok: r.status === 200, error: r.status === 200 ? null : `HTTP ${r.status}` });
+
+  if (r.status !== 200 || !r.json) {
+    return { error: r.json?.error?.message || `Anthropic respondió ${r.status}` };
+  }
+
+  const texto = (r.json.content || []).filter(c => c.type === 'text').map(c => c.text).join('').trim();
+  let dato;
+  try { dato = JSON.parse(texto.replace(/```json|```/g, '').trim()); }
+  catch (e) { return { error: 'No entendí lo que dictaste. Probá de nuevo, más despacio.' }; }
+
+  if (dato.confianza === 'baja' || !(Number(dato.kg) > 0) || !dato.producto) {
+    return { duda: dato.motivo || 'No me quedó claro qué producto o cuántos kilos.' };
+  }
+
+  // Se resuelve el producto contra la base: el modelo dice cómo se llama, la
+  // base dice cuál es. Si hay más de uno parecido, decide la persona.
+  const encontrados = await ejecutarHerramienta('buscar_producto', { texto: dato.producto });
+  const candidatos = (encontrados.resultado || []).filter(p => p.se_vende !== false);
+  if (!candidatos.length) {
+    return { duda: `No encontré ningún producto que se llame "${dato.producto}".` };
+  }
+  if (candidatos.length > 1) {
+    return {
+      elegir: candidatos.slice(0, 5).map(p => ({ id: p.id, nombre: p.nombre, kg_a_granel: p.kg_a_granel })),
+      kg: Number(dato.kg), sucursal: dato.sucursal || null,
+      duda: 'Hay más de un producto que puede ser. ¿Cuál era?',
+    };
+  }
+
+  const p = candidatos[0];
+  return {
+    propuesta: {
+      producto_id: p.id,
+      nombre: p.nombre,
+      kg: Number(dato.kg),
+      sucursal: dato.sucursal || null,
+      kg_antes: p.kg_a_granel,
+      kg_despues: Math.round((p.kg_a_granel - Number(dato.kg)) * 10) / 10,
+      alcanza: p.kg_a_granel >= Number(dato.kg),
+    },
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   ponerCORS(res);
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -703,7 +782,8 @@ const server = http.createServer(async (req, res) => {
     }));
   }
 
-  const rutaOk = req.method === 'POST' && (req.url === '/anthropic' || req.url === '/asistente');
+  const rutaOk = req.method === 'POST' &&
+    (req.url === '/anthropic' || req.url === '/asistente' || req.url === '/accion');
   if (!rutaOk) {
     res.writeHead(404); return res.end(JSON.stringify({ error: 'ruta no encontrada' }));
   }
@@ -737,7 +817,19 @@ const server = http.createServer(async (req, res) => {
       }));
     }
 
-    // ── 4a) El asistente con herramientas ──
+    // ── 4a) Entender lo que alguien dictó ──
+    if (req.url === '/accion') {
+      const frase = String(body.frase || '').trim();
+      if (!frase) { res.writeHead(400); return res.end(JSON.stringify({ error: 'falta la frase' })); }
+      const r = await entenderAccion({
+        frase, usuario: user.id,
+        modelo: MODELOS_OK.includes(body.model) ? body.model : MODELO_ASISTENTE,
+      });
+      if (r.error) { res.writeHead(502); return res.end(JSON.stringify(r)); }
+      return res.end(JSON.stringify({ ...r, gasto: await puedeGastar() }));
+    }
+
+    // ── 4b) El asistente con herramientas ──
     if (req.url === '/asistente') {
       const modelo = MODELOS_OK.includes(body.model) ? body.model : MODELO_ASISTENTE;
       const pregunta = String(body.pregunta || '').trim();
@@ -766,7 +858,7 @@ const server = http.createServer(async (req, res) => {
       }));
     }
 
-    // ── 4b) La ruta de siempre: se reenvía tal cual ──
+    // ── 4c) La ruta de siempre: se reenvía tal cual ──
     if (!MODELOS_OK.includes(body.model)) {
       res.writeHead(400);
       return res.end(JSON.stringify({ error: `modelo no permitido: ${body.model}` }));
@@ -840,4 +932,4 @@ server.listen(PORT, () => {
   revisionDeArranque();
 });
 
-module.exports = { server, HERRAMIENTAS, ejecutarHerramienta, conversarConHerramientas };
+module.exports = { server, HERRAMIENTAS, ejecutarHerramienta, conversarConHerramientas, entenderAccion };
