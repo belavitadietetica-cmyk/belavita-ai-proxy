@@ -590,7 +590,48 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(
-  `belavita-ai-proxy escuchando en :${PORT} · ${srv ? HERRAMIENTAS.length + ' herramientas' : 'sin herramientas (falta SUPABASE_SERVICE_KEY)'}`));
+// ══════════════════════════════════════════════════════════════════════
+//  REVISIÓN AL ARRANCAR
+//
+//  Dos preguntas, una sola vez, apenas levanta: ¿ve los productos? ¿puede
+//  consultar el tope? Las dos responden a la misma duda —si la llave que
+//  está configurada es la de servicio o la anónima— y la respuesta queda en
+//  el log antes de que nadie pregunte nada.
+//
+//  Con la llave anónima no falla ruidosamente: las consultas devuelven CERO
+//  filas, sin error, porque las reglas de la base no la dejan ver nada. Eso
+//  es exactamente lo que se ve desde afuera como "el asistente no encuentra
+//  ningún producto".
+// ══════════════════════════════════════════════════════════════════════
+async function revisionDeArranque() {
+  if (!srv) return;
+
+  try {
+    const { count, error } = await srv.schema('ops').from('productos')
+      .select('id', { count: 'exact', head: true });
+    if (error) console.error('✗ no puede leer los productos:', error.message);
+    else if (!count) console.error(
+      '✗ ve 0 productos. Si en Cyron hay productos cargados, la llave configurada ' +
+      'no es la de servicio: revisá SUPABASE_SERVICE_KEY (service_role / secret, no la anon).');
+    else console.log(`✓ ve ${count} productos`);
+  } catch (e) {
+    console.error('✗ no puede leer los productos:', e.message);
+  }
+
+  try {
+    const { error } = await srv.schema('ops').rpc('ia_puede_gastar');
+    if (error) console.error(
+      '✗ no puede consultar el tope:', error.message,
+      '— si dice "permission denied", la llave no es la de servicio o falta el grant a service_role.');
+    else console.log('✓ puede consultar el tope y anotar el gasto');
+  } catch (e) {
+    console.error('✗ no puede consultar el tope:', e.message);
+  }
+}
+
+server.listen(PORT, () => {
+  console.log(`belavita-ai-proxy escuchando en :${PORT} · ${srv ? HERRAMIENTAS.length + ' herramientas' : 'sin herramientas (falta SUPABASE_SERVICE_KEY)'}`);
+  revisionDeArranque();
+});
 
 module.exports = { server, HERRAMIENTAS, ejecutarHerramienta, conversarConHerramientas };
