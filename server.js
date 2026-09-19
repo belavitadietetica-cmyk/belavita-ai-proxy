@@ -230,11 +230,36 @@ async function ejecutarHerramienta(nombre, entrada) {
   if (nombre === 'buscar_producto') {
     const texto = String(e.texto || '').trim().slice(0, 60);
     if (!texto) return { error: 'Falta qué buscar' };
-    const { data: prods, error } = await srv.schema('ops').from('productos')
-      .select('id,nombre,marca,precio_venta,costo_sin_iva,stock_kg_actual,activo,se_vende')
-      .or(`nombre.ilike.%${texto}%,marca.ilike.%${texto}%`).limit(8);
-    if (error) throw new Error(error.message);
-    if (!prods?.length) return { resultado: [], nota: 'No hay ningún producto con ese nombre' };
+    // ── DOS BÚSQUEDAS, NO UN `or` ──
+    //
+    // Con .or(...) el patrón viaja adentro de un texto que PostgREST vuelve a
+    // parsear, y el % del ilike se pierde por el camino: la consulta no
+    // fallaba, devolvía CERO. El asistente entonces contestaba "no tengo
+    // ningún producto con ese nombre" teniendo 2.022 cargados.
+    //
+    // Dos consultas simples y se juntan acá. Y si el texto trae varias
+    // palabras —"almendra premium"— se busca también por la primera sola,
+    // porque nadie escribe el nombre tal cual está en el sistema.
+    const columnas = 'id,nombre,marca,precio_venta,costo_sin_iva,stock_kg_actual,activo,se_vende';
+    const patrones = [texto];
+    const primera = texto.split(/\s+/)[0];
+    if (primera && primera.length >= 4 && primera !== texto) patrones.push(primera);
+
+    const encontrados = new Map();
+    for (const patron of patrones) {
+      const [porNombre, porMarca] = await Promise.all([
+        srv.schema('ops').from('productos').select(columnas).ilike('nombre', `%${patron}%`).limit(8),
+        srv.schema('ops').from('productos').select(columnas).ilike('marca', `%${patron}%`).limit(8),
+      ]);
+      if (porNombre.error) throw new Error(porNombre.error.message);
+      for (const p of [...(porNombre.data || []), ...(porMarca.data || [])]) {
+        if (!encontrados.has(p.id)) encontrados.set(p.id, p);
+      }
+      if (encontrados.size) break;   // si la búsqueda exacta trajo algo, alcanza
+    }
+
+    const prods = [...encontrados.values()].slice(0, 8);
+    if (!prods.length) return { resultado: [], nota: 'No hay ningún producto con ese nombre' };
 
     const ids = prods.map(p => p.id);
     const [{ data: stock }, { data: vend }] = await Promise.all([
