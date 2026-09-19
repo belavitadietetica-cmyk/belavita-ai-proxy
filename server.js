@@ -198,6 +198,14 @@ const HERRAMIENTAS = [
     input_schema: { type: 'object', properties: {} },
   },
   {
+    name: 'que_fraccionar',
+    description: 'Qué conviene fraccionar hoy: productos que se venden por unidad, con poco stock en algún local, y que tienen mercadería a granel o en bulto esperando. Usala para "qué fracciono", "qué hay para fraccionar" o cuando pregunten por el trabajo del día.',
+    input_schema: {
+      type: 'object',
+      properties: { limite: { type: 'integer', description: 'Cuántos traer (máximo 25)' } },
+    },
+  },
+  {
     name: 'proveedores',
     description: 'Los proveedores: qué se les debe, qué vence pronto y cuánto se les compró. Usala para "a quién le debo", "qué pago esta semana", "cuánto le compramos a X" o cuando la pregunta sea sobre compras.',
     input_schema: {
@@ -464,6 +472,56 @@ async function ejecutarHerramienta(nombre, entrada) {
     };
   }
 
+  if (nombre === 'que_fraccionar') {
+    const limite = tope(e.limite, 12, 25);
+    const [prods, stock, vend, locales] = await Promise.all([
+      traerTodo(srv, 'ops', 'productos',
+        'id,nombre,marca,stock_kg_actual,stock_minimo_sucursal,producto_bulk_id,activo,se_vende,categoria_id',
+        q => q.eq('activo', true).eq('se_vende', true)),
+      traerTodo(srv, 'ops', 'stock_sucursal', 'producto_id,sucursal_id,cantidad'),
+      traerTodo(srv, 'club', 'ventas_resumen', 'producto_id,unidades'),
+      sucursales(),
+    ]);
+
+    const granel = Object.fromEntries(prods.map(p => [p.id, Number(p.stock_kg_actual) || 0]));
+    const ventas = Object.fromEntries(vend.map(v => [v.producto_id, Number(v.unidades) || 0]));
+    const porProd = {};
+    stock.forEach(s => {
+      porProd[s.producto_id] = porProd[s.producto_id] || {};
+      porProd[s.producto_id][s.sucursal_id] = Number(s.cantidad) || 0;
+    });
+
+    // Lo que hay que fraccionar es lo que se vende por unidad, está flojo en
+    // algún local, y tiene de dónde salir: su bulto con kilos cargados.
+    const lista = prods
+      .map(p => {
+        const kgDisponibles = p.producto_bulk_id
+          ? (granel[p.producto_bulk_id] || 0)
+          : (Number(p.stock_kg_actual) || 0);
+        const porLocal = conNombres(porProd[p.id], locales);
+        const total = Object.values(porLocal).reduce((a, b) => a + b, 0);
+        const minimo = Number(p.stock_minimo_sucursal) || 0;
+        return {
+          producto: p.nombre, marca: p.marca,
+          unidades_por_local: porLocal, unidades_total: total,
+          minimo_por_local: minimo,
+          kg_a_granel: kgDisponibles,
+          unidades_90d: ventas[p.id] || 0,
+          falta_en: Object.entries(porLocal).filter(([, u]) => minimo > 0 && u <= minimo).map(([l]) => l),
+        };
+      })
+      .filter(x => x.kg_a_granel > 0 && x.falta_en.length)
+      .sort((a, b) => b.unidades_90d - a.unidades_90d)
+      .slice(0, limite);
+
+    return {
+      resultado: lista,
+      nota: lista.length
+        ? 'ordenado por lo que más se vende; "falta_en" son los locales por debajo del mínimo'
+        : 'No hay nada urgente para fraccionar: lo que está flojo no tiene granel cargado, o lo que tiene granel está bien de stock',
+    };
+  }
+
   if (nombre === 'proveedores') {
     const filtro = String(e.nombre || '').trim().toLowerCase();
     const [pagos, parciales] = await Promise.all([
@@ -702,17 +760,44 @@ async function conversarConHerramientas({ pregunta, historial, usuario, modelo }
 //  Si algo no queda claro —dos productos parecidos, no se entendió la
 //  cantidad— lo dice y no propone nada.
 // ══════════════════════════════════════════════════════════════════════
-const SISTEMA_ACCION = `Traducís a datos lo que alguien dicta mientras trabaja en una dietética.
+const SISTEMA_ACCION = `Traducís a datos lo que alguien dicta mientras fracciona en una dietética.
 
 Devolvés SOLO un JSON, sin texto alrededor y sin marcas de código, con esta forma:
-{"accion":"fraccionar","producto":"texto para buscar el producto","kg":numero,"sucursal":"bv1|bv2|null","confianza":"alta|baja","motivo":"si confianza es baja, qué falta"}
+{"accion":"fraccionar",
+ "bulto":"texto para buscar el producto a granel del que se sacó",
+ "kg":numero,
+ "salidas":[{"producto":"texto para buscar la bolsa","unidades":numero,"sucursal":"bv1|bv2|null"}],
+ "confianza":"alta|baja","motivo":"si confianza es baja, qué falta"}
 
 Reglas:
-- "kg" en números, aunque lo digan en letras: "cinco kilos y medio" es 5.5.
-- La sucursal sale del nombre del local si lo dicen (Beltrán es bv1, Maipú es bv2). Si no lo dicen, null.
-- En "producto" poné solo lo justo para buscarlo: "almendra non pareil", no la frase entera.
-- Si no se entiende la cantidad, o no queda claro qué producto es, poné confianza "baja" y explicá en motivo qué falta.
+- Los números en cifras, aunque los digan en letras: "cinco kilos y medio" es 5.5, "una docena" es 12.
+- En "bulto" va lo que se fraccionó: "almendra non pareil".
+- En cada salida va la bolsa que salió, con su tamaño si lo dicen: "almendra 250", "almendra 500".
+- Si dicen a dónde va una parte ("cinco de 250 van a Maipú"), esa salida lleva su sucursal. Beltrán es bv1, Maipú es bv2. Lo que no digan a dónde va, dejalo en null: se queda donde están.
+- Si no dicen cuántas bolsas salieron, dejá "salidas" vacío: no inventes la cantidad.
+- Si no se entiende de qué producto hablan o cuántos kilos, poné confianza "baja" y explicá en motivo qué falta.
 - Nunca inventes un producto que no te nombraron.`;
+
+// ── EL LOTE Y EL VENCIMIENTO, LA MISMA REGLA QUE LA ETIQUETA ──
+//
+// Lote: el día en que se fraccionó. Vencimiento: un año. Es la misma regla
+// que usa la impresora de etiquetas en Cyron, y tiene que seguir siendo la
+// misma: lo que dice la bolsa y lo que dice el sistema no pueden separarse.
+function loteDeHoy() {
+  const hoy = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Argentina/Mendoza' }));
+  const dd = String(hoy.getDate()).padStart(2, '0');
+  const mm = String(hoy.getMonth() + 1).padStart(2, '0');
+  return { lote: `${dd}${mm}${hoy.getFullYear()}`, fecha: hoy };
+}
+
+function vencimientoDeHoy() {
+  const { fecha } = loteDeHoy();
+  const d = new Date(fecha);
+  const dia = d.getDate();
+  d.setMonth(d.getMonth() + 12);
+  if (d.getDate() !== dia) d.setDate(0);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 
 async function entenderAccion({ frase, usuario, modelo }) {
   const r = await llamarAnthropic({
@@ -734,35 +819,72 @@ async function entenderAccion({ frase, usuario, modelo }) {
   try { dato = JSON.parse(texto.replace(/```json|```/g, '').trim()); }
   catch (e) { return { error: 'No entendí lo que dictaste. Probá de nuevo, más despacio.' }; }
 
-  if (dato.confianza === 'baja' || !(Number(dato.kg) > 0) || !dato.producto) {
+  const bultoTexto = dato.bulto || dato.producto;   // "producto" es como lo decía la versión anterior
+  if (dato.confianza === 'baja' || !(Number(dato.kg) > 0) || !bultoTexto) {
     return { duda: dato.motivo || 'No me quedó claro qué producto o cuántos kilos.' };
   }
 
-  // Se resuelve el producto contra la base: el modelo dice cómo se llama, la
-  // base dice cuál es. Si hay más de uno parecido, decide la persona.
-  const encontrados = await ejecutarHerramienta('buscar_producto', { texto: dato.producto });
-  const candidatos = (encontrados.resultado || []).filter(p => p.se_vende !== false);
+  // Se resuelve contra la base: el modelo dice cómo se llama, la base dice
+  // cuál es. Si hay más de uno parecido, decide la persona.
+  const buscar = async (texto) => {
+    const r = await ejecutarHerramienta('buscar_producto', { texto });
+    return (r.resultado || []).filter(p => p.se_vende !== false);
+  };
+
+  const candidatos = await buscar(bultoTexto);
   if (!candidatos.length) {
-    return { duda: `No encontré ningún producto que se llame "${dato.producto}".` };
+    return { duda: `No encontré ningún producto que se llame "${bultoTexto}".` };
   }
   if (candidatos.length > 1) {
     return {
       elegir: candidatos.slice(0, 5).map(p => ({ id: p.id, nombre: p.nombre, kg_a_granel: p.kg_a_granel })),
-      kg: Number(dato.kg), sucursal: dato.sucursal || null,
+      kg: Number(dato.kg), sucursal: dato.salidas?.[0]?.sucursal || null,
       duda: 'Hay más de un producto que puede ser. ¿Cuál era?',
     };
   }
 
-  const p = candidatos[0];
+  const bulto = candidatos[0];
+  const { lote } = loteDeHoy();
+  const vence = vencimientoDeHoy();
+
+  // ── LAS BOLSAS QUE SALIERON ──
+  //
+  // Cada una se busca igual que el bulto. Si alguna no se puede resolver, se
+  // devuelve la duda en vez de una propuesta a medias: registrar la mitad de
+  // un fraccionamiento es peor que no registrarlo.
+  const salidas = [];
+  for (const s of (dato.salidas || [])) {
+    const uds = Number(s.unidades);
+    if (!(uds > 0) || !s.producto) continue;
+    const opciones = await buscar(s.producto);
+    if (!opciones.length) {
+      return { duda: `No encontré la bolsa "${s.producto}". ¿Cómo se llama en el sistema?` };
+    }
+    if (opciones.length > 1) {
+      return {
+        duda: `Hay más de una bolsa que puede ser "${s.producto}": ${opciones.slice(0, 4).map(o => o.nombre).join(', ')}. Decímelo más preciso.`,
+      };
+    }
+    salidas.push({
+      producto_id: opciones[0].id,
+      nombre: opciones[0].nombre,
+      unidades: uds,
+      sucursal: s.sucursal || null,
+    });
+  }
+
   return {
     propuesta: {
-      producto_id: p.id,
-      nombre: p.nombre,
+      producto_id: bulto.id,
+      nombre: bulto.nombre,
       kg: Number(dato.kg),
-      sucursal: dato.sucursal || null,
-      kg_antes: p.kg_a_granel,
-      kg_despues: Math.round((p.kg_a_granel - Number(dato.kg)) * 10) / 10,
-      alcanza: p.kg_a_granel >= Number(dato.kg),
+      sucursal: salidas.find(s => s.sucursal)?.sucursal || null,
+      kg_antes: bulto.kg_a_granel,
+      kg_despues: Math.round((bulto.kg_a_granel - Number(dato.kg)) * 10) / 10,
+      alcanza: bulto.kg_a_granel >= Number(dato.kg),
+      lote,
+      vence,
+      salidas,
     },
   };
 }
