@@ -34,6 +34,8 @@
 
 const http = require('http');
 const { createClient } = require('@supabase/supabase-js');
+// Creativo: trae de Meta los datos de los anuncios una vez por día.
+const mkt = require('./mkt-sync');
 
 const PORT              = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;   // la key NUEVA (no la filtrada)
@@ -911,7 +913,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   const rutaOk = req.method === 'POST' &&
-    (req.url === '/anthropic' || req.url === '/asistente' || req.url === '/accion');
+    (req.url === '/anthropic' || req.url === '/asistente' || req.url === '/accion' || req.url === '/mkt/sync');
   if (!rutaOk) {
     res.writeHead(404); return res.end(JSON.stringify({ error: 'ruta no encontrada' }));
   }
@@ -924,6 +926,16 @@ const server = http.createServer(async (req, res) => {
 
     const { data: { user }, error: eUser } = await sb.auth.getUser(token);
     if (eUser || !user) { res.writeHead(401); return res.end(JSON.stringify({ error: 'sesión inválida o vencida' })); }
+
+    // ── CREATIVO: "sincronizar ahora", desde el panel ──
+    // No usa la IA, así que no pasa por el tope de gasto.
+    if (req.url === '/mkt/sync') {
+      if (!mkt.configurado()) {
+        return res.end(JSON.stringify({ ok: false, motivo: 'Falta cargar el token de Meta en el servidor' }));
+      }
+      const r = await mkt.sincronizarMeta(srv);
+      return res.end(JSON.stringify(r));
+    }
 
     // ── 2) Leer y validar el body ──
     const bodyRaw = await leerBody(req);
@@ -1058,6 +1070,8 @@ async function revisionDeArranque() {
 server.listen(PORT, () => {
   console.log(`belavita-ai-proxy escuchando en :${PORT} · ${srv ? HERRAMIENTAS.length + ' herramientas' : 'sin herramientas (falta SUPABASE_SERVICE_KEY)'}`);
   revisionDeArranque();
+  // Creativo: la sincronización diaria con Meta (si está el token).
+  mkt.programar(srv);
 });
 
 module.exports = { server, HERRAMIENTAS, ejecutarHerramienta, conversarConHerramientas, entenderAccion };
