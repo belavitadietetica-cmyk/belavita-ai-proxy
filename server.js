@@ -360,7 +360,11 @@ async function ejecutarHerramienta(nombre, entrada) {
         precio: Number(p.precio_venta) || 0,
         costo_sin_iva: Number(p.costo_sin_iva) || 0,
         stock_por_sucursal: conNombres(porProd[p.id], locales),
-        kg_a_granel: Number(p.stock_kg_actual) || 0,
+        // Los bultos se cuentan en kilos en stock_sucursal, que es lo que
+        // muestra Registros. stock_kg_actual quedó de una carga vieja.
+        kg_a_granel: /bulto cerrado/i.test(p.nombre || '')
+          ? Object.values(porProd[p.id] || {}).reduce((a, b) => a + b, 0)
+          : (Number(p.stock_kg_actual) || 0),
         unidades_90d: ventas[p.id] || 0,
         se_vende: p.se_vende !== false && p.activo !== false,
       })),
@@ -483,7 +487,11 @@ async function ejecutarHerramienta(nombre, entrada) {
       sucursales(),
     ]);
 
-    const granel = Object.fromEntries(prods.map(p => [p.id, Number(p.stock_kg_actual) || 0]));
+    // Los kilos de cada bulto, del stock real (stock_sucursal), no de la
+    // columna vieja stock_kg_actual.
+    const totalStock = {};
+    stock.forEach(s => { totalStock[s.producto_id] = (totalStock[s.producto_id] || 0) + (Number(s.cantidad) || 0); });
+    const granel = Object.fromEntries(prods.map(p => [p.id, totalStock[p.id] || 0]));
     const ventas = Object.fromEntries(vend.map(v => [v.producto_id, Number(v.unidades) || 0]));
     const porProd = {};
     stock.forEach(s => {
@@ -495,9 +503,7 @@ async function ejecutarHerramienta(nombre, entrada) {
     // algún local, y tiene de dónde salir: su bulto con kilos cargados.
     const lista = prods
       .map(p => {
-        const kgDisponibles = p.producto_bulk_id
-          ? (granel[p.producto_bulk_id] || 0)
-          : (Number(p.stock_kg_actual) || 0);
+        const kgDisponibles = p.producto_bulk_id ? (granel[p.producto_bulk_id] || 0) : 0;
         const porLocal = conNombres(porProd[p.id], locales);
         const total = Object.values(porLocal).reduce((a, b) => a + b, 0);
         const minimo = Number(p.stock_minimo_sucursal) || 0;
